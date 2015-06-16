@@ -1,0 +1,243 @@
+#!/bin/bash
+#
+# Script to set up a droplet.
+
+ALL_COMMANDS="init-debian build-pandoc install-haskell-platform setup-swap missing-libs setup-user usage"
+
+run () {
+  echo "+ $@"
+  "$@"
+}
+
+run_conditionally () {
+  marker="$1"
+  shift
+  if [ ! -e "$marker" ]; then
+    run "$@"
+    touch "$marker"
+  fi
+}
+
+assert_running_as_root () {
+  if [ ! -w / ]; then
+    echo Must be running as root
+    exit 1
+  fi
+}
+
+setup_swap() {
+  swap_path="/swap"
+  swap_size=4096
+
+  if ! test -e "$swap_path"; then
+    run fallocate -l ${swap_size}M "$swap_path"
+    run chmod 600 $swap_path
+    run mkswap $swap_path
+    run swapon $swap_path
+  fi
+
+  if ! grep -q swap /etc/fstab; then
+    echo "adding $swap_path to /etc/fstab"
+    echo "$swap_path none swap defaults 0 0" >> /etc/fstab
+  fi
+}
+
+setup_user() {
+  user="$1"
+  if [ -z "$user" ]; then
+    echo "setup_user: no user name supplied"
+    return
+  fi
+
+  if ! grep "^$user" /etc/passwd; then
+    home=/home/$user
+    run useradd -m -d $home -s /bin/bash -k /etc/skel $user
+
+    run mkdir $home/.ssh
+    run chmod go-rwx $home/.ssh
+    run chown $user.$user $home/.ssh
+
+    run cp /root/.ssh/authorized_keys $home/.ssh/
+
+    run chown $user.$user $home/.ssh/authorized_keys
+    run chmod go-rwx $home/.ssh/authorized_keys
+
+    run mkdir $home/download
+    run chown $user.$user $home/download
+  fi
+}
+
+setup_debs () {
+  run apt-get update
+  run apt-get install -y libgmp3-dev zlib1g-dev freeglut3 libglu1-mesa
+}
+
+setup_devel_debs() {
+  run apt-get install -y build-essentials git
+}
+
+set_user() {
+  user="$1"
+  home="/home/$user"
+}
+
+check_var () {
+  if [ -z "$2" ]; then
+    echo "variable $1 is not set"
+    exit 1
+  fi
+}
+
+create_dir () {
+  check_var user "$user"
+  # create_dir dir
+  local dir="$1"
+  if [ ! -d "$dir" ]; then
+    run mkdir -p "$dir"
+  fi
+  run chown $user.$user $dir
+  run chmod 0755 $dir
+}
+
+fetch_url() {
+  check_var home "$home"
+  dir="$home/download"
+  create_dir "$dir"
+  wget -P "$dir" "$@"
+}
+
+get_clone() {
+  check_var home "$home"
+  dir="$home/repos"
+  create_dir "$dir"
+  git clone "$1" "$dir"
+}
+
+fetch_ghc_7_10_1_bindist() {
+  fetch_url https://www.haskell.org/ghc/dist/7.10.1/ghc-7.10.1-x86_64-unknown-linux-deb7.tar.xz
+}
+
+fetch_ghc_7_8_4_bindist() {
+  fetch_url https://www.haskell.org/ghc/dist/7.8.4/ghc-7.8.4-x86_64-unknown-linux-deb7.tar.xz
+}
+
+git_clone_haskell_platform() {
+  git_clone https://github.com/haskell/haskell-platform
+}
+
+git_clone_haskell_platform_erantapaa() {
+  git_clone https://github.com/erantapaa/haskell-platform
+}
+
+git_clone_hl() {
+  git_clone https://github.com/haskell-infra/hl
+}
+
+install_haskell_platform() {
+  dir=/tmp
+  hptar = haskell-platform-2014.2.0.0-unknown-linux-x86_64.tar.gz
+  # install the 2014.2.0.0 Haskell Platform
+  if [ ! -d /usr/local/haskell ]; then
+    if [ -e "$dir/$hptar" ] ; then
+      run wget -P $dir https://www.haskell.org/platform/download/2014.2.0.0/haskell-platform-2014.2.0.0-unknown-linux-x86_64.tar.gz
+    fi
+    if [ ! -e "$dir/$hptar" ]; then
+      echo "=== failed to download $hptar"
+      exit 1
+    fi
+    cd /
+    run sudo tar xvf "$dir/$hptar"
+    run sudo /usr/local/haskell/ghc-7.8.3-x86_64/bin/activate-hs
+  fi
+
+  run cabal update
+  run cabal install cabal-install hscolour
+}
+
+fetch_url() {
+  local url="$1"
+  local dir="$2"
+  local dest="$dir/$(basename $url)"
+  if [ ! -e "$dest" ]; then
+    run wget -P "$dir" "$url"
+  fi
+  result="$dest"
+}
+
+missing_libs () {
+  cd /usr/local/haskell
+  find . -name '*.so' | while read x; do echo "=== $x"; ldd $x; done > /tmp/ldd-report
+  echo "Report written to /tmp/ldd-report"
+  echo "Missing libraries:"
+  grep -v libHS /tmp/ldd-report | grep -i 'not found'
+}
+
+fetch_rc1() {
+  local dir="$1"
+  local url="http://www.ozonehouse.com/mark/platform/haskell-platform-7.10.1.20150612-x86_64-unknown-linux-deb7.tar.gz"
+  fetch_url $url "$dir"
+  echo "done with fetch_rc1, result: $result"
+}
+
+install_haskell_platform() {
+  cd
+  fetch_rc1 "download"
+  run tar xf "$result"
+  run ./install-haskell-platform.sh
+}
+
+init_debian () {
+  assert_running_as_root
+  setup_swap
+  setup_user erantapaa
+  run_conditionally "/did-apt-get-update" apt-get update
+  run_conditionally "/did-install-haskell" install_haskell_platform
+  apt-get install -y tmux
+}
+
+build_pandoc () {
+  pandoc_dir=pandoc-1.14.0.4
+  if [ ! -d $pandoc_dir ]; then
+    run_conditionall "$HOME/did-cabal-update" cabal update
+    run cabal get pandoc-1.14.0.4
+  fi
+  cd "$pandoc_dir" || { echo "unable to cd into $pandoc_dir"; exit 1
+    }
+  run cabal sandbox init
+  run cabal install --only-dependencies
+  run cabal build
+}
+
+usage () {
+  echo
+  echo "Usage: setup <command>"
+  echo
+  echo "Commands:"
+  for cmd in $ALL_COMMANDS; do
+    echo "  $cmd"
+  done
+}
+
+list_contains() {
+  for word in $1; do
+    [[ $word = "$2" ]] && return 0
+  done
+  return 1
+}
+
+main () {
+  if [ "$#" == 0 ]; then
+    usage
+    exit 0
+  elif list_contains "$ALL_COMMANDS" "$1"; then
+    local cmd="${1//-/_}"
+    shift
+    "$cmd" "$@"
+  else
+    echo "unrecognized command: $1"
+    exit 1
+  fi
+}    
+
+main "$@"
+
